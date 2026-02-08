@@ -3,6 +3,8 @@
   hosts: traefik_vm
   become: true
   gather_facts: true
+  collections:
+    - community.docker
 
   vars:
     # --- NAS ---
@@ -60,18 +62,19 @@
     # -------------------------
     # Docker repo "de-conflict" then install Docker
     # -------------------------
-    - name: Remove any existing Docker apt repo list files that mention download.docker.com
-      ansible.builtin.shell: |
-        set -euo pipefail
-        shopt -s nullglob
-        for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
-          if grep -q "download.docker.com" "$f"; then
-            echo "Removing docker repo list file: $f"
-            rm -f "$f"
-          fi
-        done
-      args:
-        executable: /bin/bash
+    - name: Remove docker.com entries from /etc/apt/sources.list
+      ansible.builtin.lineinfile:
+        path: /etc/apt/sources.list
+        regexp: '.*download\.docker\.com.*'
+        state: absent
+
+    - name: Remove docker.com entries from /etc/apt/sources.list.d/*.list
+      ansible.builtin.lineinfile:
+        path: "{{ item }}"
+        regexp: '.*download\.docker\.com.*'
+        state: absent
+      loop: "{{ lookup('ansible.builtin.fileglob', '/etc/apt/sources.list.d/*.list', wantlist=True) }}"
+      when: (lookup('ansible.builtin.fileglob', '/etc/apt/sources.list.d/*.list', wantlist=True) | length) > 0
 
     - name: Remove conflicting old Docker key if present (docker.gpg)
       ansible.builtin.file:
@@ -231,17 +234,12 @@
             traefik:
               driver: bridge
 
-    - name: Pull images
-      ansible.builtin.shell: |
-        docker compose -f {{ traefik_workdir }}/docker-compose.yml pull
-      args:
-        executable: /bin/bash
-
-    - name: Bring up Traefik
-      ansible.builtin.shell: |
-        docker compose -f {{ traefik_workdir }}/docker-compose.yml up -d
-      args:
-        executable: /bin/bash
+    - name: Ensure Traefik is running via Compose
+      community.docker.docker_compose_v2:
+        project_src: "{{ traefik_workdir }}"
+        files:
+          - docker-compose.yml
+        state: present
 
     - name: Show Traefik container status
       ansible.builtin.shell: |
