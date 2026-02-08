@@ -1,0 +1,23 @@
+# NAS exports (NFS)
+nas_ip: "192.168.3.10"
+
+nfs_exports:
+  - src: "{{ nas_ip }}:/volume1/docker/traefik"
+    path: "/mnt/nas/traefik"
+    opts: "rw,_netdev,hard,timeo=600,retrans=2"
+  - src: "{{ nas_ip }}:/volume1/docker/acme/certs"
+    path: "/mnt/nas/certs"
+    opts: "ro,_netdev,hard,timeo=600,retrans=2"
+
+# Traefik runtime
+traefik_version: "v3.1"
+traefik_container_name: "traefik"
+traefik_network: "proxy"
+
+# Files inside VM
+traefik_workdir: "/opt/traefik"
+
+# Cert file paths (inside VM, via NFS mount)
+# Update filenames to match your actual files:
+wildcard_fullchain: "/mnt/nas/certs/certificates/novikov.nl.fullchain.crt"
+wildcard_privkey: "/mnt/nas/certs/private/novikov.nl.key"

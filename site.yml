@@ -1,0 +1,264 @@
+---
+- name: Provision Traefik VM (Ubuntu) with Docker + Traefik
+  hosts: traefik_vm
+  become: true
+  gather_facts: true
+
+  vars:
+    # --- NAS ---
+    nas_ip: "192.168.3.10"
+    nas_traefik_export: "/volume1/docker/traefik"
+    nas_certs_export: "/volume1/docker/acme/certs"
+
+    # --- VM mountpoints ---
+    nas_mount_base: "/srv/nas"
+    traefik_nas_mount: "/srv/nas/traefik"
+    certs_nas_mount: "/srv/nas/certs"
+
+    # --- Where we deploy compose on the VM ---
+    traefik_workdir: "/opt/traefik"
+
+    # --- Cert filenames on the NAS ---
+    wildcard_fullchain: "{{ certs_nas_mount }}/certificates/novikov.nl.fullchain.crt"
+    wildcard_privkey: "{{ certs_nas_mount }}/certificates/novikov.nl.key"
+
+    # --- Docker / Traefik ---
+    traefik_image: "traefik:v3.1"
+    traefik_container_name: "traefik"
+
+    base_packages:
+      - ca-certificates
+      - curl
+      - gnupg
+      - lsb-release
+      - apt-transport-https
+      - nfs-common
+      - jq
+
+    nfs_mounts:
+      - src: "{{ nas_ip }}:{{ nas_traefik_export }}"
+        path: "{{ traefik_nas_mount }}"
+        opts: "rw,_netdev,hard,timeo=600,retrans=2"
+      - src: "{{ nas_ip }}:{{ nas_certs_export }}"
+        path: "{{ certs_nas_mount }}"
+        opts: "ro,_netdev,hard,timeo=600,retrans=2"
+
+  tasks:
+    # -------------------------
+    # Base OS packages
+    # -------------------------
+    - name: Ensure apt cache is fresh
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Install base packages
+      ansible.builtin.apt:
+        name: "{{ base_packages }}"
+        state: present
+
+    # -------------------------
+    # Docker repo "de-conflict" then install Docker
+    # -------------------------
+    - name: Remove any existing Docker apt repo list files that mention download.docker.com
+      ansible.builtin.shell: |
+        set -euo pipefail
+        shopt -s nullglob
+        for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+          if grep -q "download.docker.com" "$f"; then
+            echo "Removing docker repo list file: $f"
+            rm -f "$f"
+          fi
+        done
+      args:
+        executable: /bin/bash
+
+    - name: Remove conflicting old Docker key if present (docker.gpg)
+      ansible.builtin.file:
+        path: /etc/apt/keyrings/docker.gpg
+        state: absent
+
+    - name: Create keyrings dir
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Add Docker GPG key (ASCII armored)
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: "0644"
+
+    - name: Add Docker apt repo (normalized Signed-By)
+      ansible.builtin.copy:
+        dest: /etc/apt/sources.list.d/docker.list
+        mode: "0644"
+        content: |
+          deb [arch={{ ansible_architecture }} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable
+
+    - name: Update apt cache after adding Docker repo
+      ansible.builtin.apt:
+        update_cache: true
+
+    - name: Install Docker Engine + Compose plugin
+      ansible.builtin.apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-buildx-plugin
+          - docker-compose-plugin
+        state: present
+
+    - name: Ensure docker service is enabled and running
+      ansible.builtin.service:
+        name: docker
+        enabled: true
+        state: started
+
+    - name: Add user to docker group
+      ansible.builtin.user:
+        name: "{{ ansible_user }}"
+        groups: docker
+        append: true
+
+    # -------------------------
+    # NFS mounts from Synology
+    # -------------------------
+    - name: Create mount base
+      ansible.builtin.file:
+        path: "{{ nas_mount_base }}"
+        state: directory
+        mode: "0755"
+
+    - name: Create mount points (do not chmod/chown mountpoints)
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+      loop:
+        - "{{ traefik_nas_mount }}"
+        - "{{ certs_nas_mount }}"
+
+    - name: Unmount stale mounts if present
+      ansible.builtin.mount:
+        path: "{{ item.path }}"
+        state: unmounted
+      loop: "{{ nfs_mounts }}"
+      ignore_errors: true
+
+    - name: Mount NAS exports and persist in fstab
+      ansible.builtin.mount:
+        src: "{{ item.src }}"
+        path: "{{ item.path }}"
+        fstype: nfs
+        opts: "{{ item.opts }}"
+        state: mounted
+      loop: "{{ nfs_mounts }}"
+
+    # -------------------------
+    # Sanity checks before start
+    # -------------------------
+    - name: Verify cert files exist on mounted NAS
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ wildcard_fullchain }}"
+        - "{{ wildcard_privkey }}"
+      register: cert_stats
+
+    - name: Fail if cert files missing
+      ansible.builtin.fail:
+        msg: "Missing cert/key file: {{ item.stat.path }}"
+      when: not item.stat.exists
+      loop: "{{ cert_stats.results }}"
+
+    # -------------------------
+    # Deploy Traefik compose (Traefik reads configs from NAS /dynamic)
+    # -------------------------
+    - name: Create traefik workdir
+      ansible.builtin.file:
+        path: "{{ traefik_workdir }}"
+        state: directory
+        mode: "0755"
+
+    - name: Write docker-compose.yml for Traefik
+      ansible.builtin.copy:
+        dest: "{{ traefik_workdir }}/docker-compose.yml"
+        mode: "0644"
+        content: |
+          services:
+            traefik:
+              image: {{ traefik_image }}
+              container_name: {{ traefik_container_name }}
+              restart: unless-stopped
+
+              ports:
+                - "80:80"
+                - "443:443"
+
+              command:
+                - "--log.level=INFO"
+                - "--api.dashboard=true"
+                - "--api.insecure=false"
+                - "--accesslog=true"
+                - "--accesslog.format=json"
+
+                - "--providers.docker=true"
+                - "--providers.docker.exposedbydefault=false"
+
+                - "--providers.file.directory=/dynamic"
+                - "--providers.file.watch=true"
+
+                - "--entrypoints.web.address=:80"
+                - "--entrypoints.websecure.address=:443"
+                - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+                - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+
+              volumes:
+                - /var/run/docker.sock:/var/run/docker.sock:ro
+
+                # existing dynamic config from Synology
+                - {{ traefik_nas_mount }}:/dynamic:ro
+
+                # existing wildcard certs from Synology
+                - {{ certs_nas_mount }}:/certs:ro
+
+              networks:
+                - traefik
+
+          networks:
+            traefik:
+              driver: bridge
+
+    - name: Pull images
+      ansible.builtin.shell: |
+        docker compose -f {{ traefik_workdir }}/docker-compose.yml pull
+      args:
+        executable: /bin/bash
+
+    - name: Bring up Traefik
+      ansible.builtin.shell: |
+        docker compose -f {{ traefik_workdir }}/docker-compose.yml up -d
+      args:
+        executable: /bin/bash
+
+    - name: Show Traefik container status
+      ansible.builtin.shell: |
+        docker ps --filter name={{ traefik_container_name }} --format 'table {{ "{{" }}.Names{{ "}}" }}\t{{ "{{" }}.Status{{ "}}" }}\t{{ "{{" }}.Ports{{ "}}" }}'
+      register: traefik_ps
+      changed_when: false
+
+    - name: Print Traefik status
+      ansible.builtin.debug:
+        msg: "{{ traefik_ps.stdout_lines }}"
+
+    - name: Show last 80 Traefik logs
+      ansible.builtin.shell: |
+        docker logs --tail 80 {{ traefik_container_name }}
+      register: traefik_logs
+      changed_when: false
+
+    - name: Print Traefik logs
+      ansible.builtin.debug:
+        msg: "{{ traefik_logs.stdout_lines }}"

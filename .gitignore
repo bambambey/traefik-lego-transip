@@ -1,0 +1,8 @@
+inventory.ini
+*.retry
+*.log
+*.pem
+*.key
+*.crt
+*.vault
+.ansible/
